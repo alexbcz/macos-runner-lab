@@ -1,0 +1,150 @@
+name: macOS DMG smoke test
+
+on:
+  workflow_dispatch:
+
+# Only read this standalone test repository; no access to the main project.
+permissions:
+  contents: read
+
+jobs:
+  smoke-macos:
+    runs-on: macos-14
+    timeout-minutes: 8
+    steps:
+      - name: Prepare log directory
+        shell: bash
+        run: mkdir -p "$RUNNER_TEMP/2ship-smoke/logs"
+
+      - name: Download staged DMG from this repository
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -Eeuo pipefail
+          mkdir -p "$RUNNER_TEMP/2ship-download"
+          gh release download smoke-input \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern '2Ship.dmg' \
+            --dir "$RUNNER_TEMP/2ship-download" \
+            --clobber
+          ls -lh "$RUNNER_TEMP/2ship-download/2Ship.dmg"
+
+      - name: Mount DMG and copy application
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          ROOT="$RUNNER_TEMP/2ship-smoke"
+          DMG="$RUNNER_TEMP/2ship-download/2Ship.dmg"
+          MOUNT="$ROOT/mount"
+          mkdir -p "$MOUNT" "$ROOT/app"
+
+          test -s "$DMG"
+          hdiutil verify "$DMG"
+          hdiutil attach "$DMG" -readonly -nobrowse -mountpoint "$MOUNT"
+          trap 'hdiutil detach "$MOUNT" -quiet || true' EXIT
+
+          APP_SOURCE="$(find "$MOUNT" -maxdepth 3 -type d -name '*.app' -print -quit)"
+          if [[ -z "$APP_SOURCE" ]]; then
+            echo '::error::No .app bundle was found in the DMG.'
+            exit 1
+          fi
+
+          APP="$ROOT/app/$(basename "$APP_SOURCE")"
+          ditto "$APP_SOURCE" "$APP"
+          plutil -lint "$APP/Contents/Info.plist"
+
+          EXEC_NAME="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP/Contents/Info.plist")"
+          BIN="$APP/Contents/MacOS/$EXEC_NAME"
+          test -x "$BIN"
+
+          echo "Application: $APP"
+          echo "Executable: $BIN"
+          file "$BIN"
+          lipo -archs "$BIN"
+          echo "SMOKE_BINARY=$BIN" >> "$GITHUB_ENV"
+
+      - name: Launch application and collect logs for 60 seconds
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          ROOT="$RUNNER_TEMP/2ship-smoke"
+          LOGS="$ROOT/logs"
+          mkdir -p "$ROOT/user-data"
+          export SHIP_HOME="$ROOT/user-data"
+
+          echo "Executing: $SMOKE_BINARY"
+          echo 'No ROM is provided in this first smoke test: no menu/scene detection is expected.'
+
+          (cd "$ROOT" && "$SMOKE_BINARY") > "$LOGS/game.log" 2>&1 &
+          GAME_PID=$!
+          echo "pid=$GAME_PID" > "$LOGS/summary.txt"
+
+          FINISHED_EARLY=0
+          for SECOND in {1..60}; do
+            if ! kill -0 "$GAME_PID" 2>/dev/null; then
+              FINISHED_EARLY=1
+              break
+            fi
+            sleep 1
+          done
+
+          if [[ "$FINISHED_EARLY" -eq 0 ]]; then
+            echo 'duration=60s (process stopped by smoke test)' >> "$LOGS/summary.txt"
+            kill -TERM "$GAME_PID" 2>/dev/null || true
+            sleep 2
+            kill -KILL "$GAME_PID" 2>/dev/null || true
+          else
+            echo "duration=${SECOND}s (process exited on its own)" >> "$LOGS/summary.txt"
+          fi
+
+          set +e
+          wait "$GAME_PID"
+          EXIT_CODE=$?
+          set -e
+          echo "exit_code=$EXIT_CODE" >> "$LOGS/summary.txt"
+
+          if grep -q 'Starting 2 Ship 2 Harkinian' "$LOGS/game.log"; then
+            echo 'engine_initialized=yes' >> "$LOGS/summary.txt"
+          else
+            echo 'engine_initialized=not_observed (expected without ROM)' >> "$LOGS/summary.txt"
+          fi
+
+          echo '=== SUMMARY ==='
+          cat "$LOGS/summary.txt"
+          echo '=== GAME LOG (last 150 lines) ==='
+          tail -n 150 "$LOGS/game.log" || true
+
+          # macOS unified logs and crash diagnostics may contain extra details.
+          /usr/bin/log show --last 3m --style compact \
+            --predicate 'process == "2s2h"' \
+            > "$LOGS/macos-unified.log" 2>&1 || true
+
+          CRASH_DIR="$HOME/Library/Logs/DiagnosticReports"
+          if [[ -d "$CRASH_DIR" ]]; then
+            mkdir -p "$LOGS/crash-reports"
+            find "$CRASH_DIR" -maxdepth 1 -type f \
+              \( -iname '*2s2h*' -o -iname '*2ship*' \) \
+              -mmin -5 -exec cp {} "$LOGS/crash-reports/" \; || true
+          fi
+
+          if [[ "$FINISHED_EARLY" -eq 1 && "$EXIT_CODE" -ne 0 ]]; then
+            echo "::error::Application exited after ${SECOND}s with code $EXIT_CODE. Inspect game.log."
+            exit 1
+          fi
+          if [[ "$FINISHED_EARLY" -eq 1 ]]; then
+            echo "::warning::Application exited after ${SECOND}s with code 0. This does not establish game initialization."
+          else
+            echo '::notice::Application survived 60 seconds. This does not establish menu or scene loading without a ROM.'
+          fi
+
+      - name: Upload smoke-test logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: 2ship-macos-smoke-logs
+          path: ${{ runner.temp }}/2ship-smoke/logs
+          retention-days: 7
+          if-no-files-found: warn
