@@ -164,7 +164,8 @@ jobs:
           SECOND=0
 
           # Extraction can take longer than the no-ROM smoke test.
-          # Stop after the engine has run for another 30 seconds, or after 240 seconds.
+          # Allow time for the full automatic sequence observed on Linux.
+          # Stop after 90 seconds of engine runtime, or after 240 seconds total.
           for ((SECOND=1; SECOND<=240; SECOND++)); do
             if ! kill -0 "$GAME_PID" 2>/dev/null; then
               STOPPED_BY_TEST=0
@@ -175,8 +176,8 @@ jobs:
               ENGINE_AT=$SECOND
               echo "Engine initialization observed after approximately ${SECOND}s"
             fi
-            if (( ENGINE_AT > 0 && SECOND - ENGINE_AT >= 30 )); then
-              STOP_REASON=engine_stable_30s
+            if (( ENGINE_AT > 0 && SECOND - ENGINE_AT >= 90 )); then
+              STOP_REASON=engine_stable_90s
               break
             fi
             sleep 1
@@ -211,6 +212,37 @@ jobs:
           fi
 
           SCENE_LOG_COUNT="$(grep -Eic 'entrance:|loading scene|load scene|scene [0-9]+|cutscene' "$LOGS/game.log" || true)"
+
+          # Check the same ordered, already-existing log markers observed on Linux.
+          # This examines the release binary's output; it does not modify that binary.
+          if python3 - "$LOGS/game.log" > "$LOGS/scene-sequence.txt" <<'PYSCENES'
+          import re
+          import sys
+          from pathlib import Path
+
+          log = Path(sys.argv[1]).read_text(encoding='utf-8', errors='replace')
+          pattern = re.compile(
+              r'Cutscene_HandleConditionalTriggers:\s*entrance:\s*(\d+),\s*cutsceneIndex:\s*(0x[0-9A-Fa-f]+)'
+          )
+          observed = [(int(m.group(1)), int(m.group(2), 16)) for m in pattern.finditer(log)]
+          expected = [(7168, 0xFFFA), (55296, 0xFFF2), (48128, 0xFFF0)]
+
+          print('Observed cutscene/entrance events:')
+          for entrance, cutscene in observed:
+              print(f'entrance={entrance} cutsceneIndex=0x{cutscene:04X}')
+
+          i = 0
+          for item in observed:
+              if i < len(expected) and item == expected[i]:
+                  i += 1
+          print(f'Expected ordered sequence: {i}/{len(expected)} events matched')
+          sys.exit(0 if i == len(expected) else 1)
+          PYSCENES
+          then
+            SCENE_SEQUENCE_OK=yes
+          else
+            SCENE_SEQUENCE_OK=no
+          fi
           {
             echo "stop_reason=$STOP_REASON"
             echo "elapsed_seconds=$SECOND"
@@ -223,6 +255,7 @@ jobs:
             fi
             echo "engine_initialized=$ENGINE_OK"
             echo "potential_scene_log_lines=$SCENE_LOG_COUNT"
+            echo "expected_scene_sequence_reached=$SCENE_SEQUENCE_OK"
           } > "$LOGS/summary.txt"
 
           /usr/bin/log show --last 7m --style compact \
@@ -251,11 +284,15 @@ jobs:
             echo '::error::Game engine initialization was not observed.'
             exit 1
           fi
-          if [[ "$STOP_REASON" != engine_stable_30s ]]; then
-            echo '::error::Game did not stay alive for 30 seconds after engine initialization.'
+          if [[ "$STOP_REASON" != engine_stable_90s ]]; then
+            echo '::error::Game did not stay alive for 90 seconds after engine initialization.'
             exit 1
           fi
-          echo '::notice::ROM extracted; game engine initialized and stayed alive for 30 seconds.'
+          if [[ "$SCENE_SEQUENCE_OK" != yes ]]; then
+            echo '::error::The 3 expected entrance/cutscene events were not observed in order. See scene-sequence.txt.'
+            exit 1
+          fi
+          echo '::notice::ROM extracted; game engine stayed alive for 90 seconds and reached all 3 expected entrance markers.'
 
       - name: Upload diagnostics (logs only)
         if: always()
