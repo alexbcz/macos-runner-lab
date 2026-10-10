@@ -1,22 +1,23 @@
-name: macOS DMG smoke test
+name: macOS runtime and extraction smoke test
 
 on:
   workflow_dispatch:
 
-# Only read this standalone test repository; no access to the main project.
 permissions:
   contents: read
 
 jobs:
   smoke-macos:
     runs-on: macos-14
-    timeout-minutes: 8
+    timeout-minutes: 12
     steps:
-      - name: Prepare log directory
+      - name: Prepare private test directories
         shell: bash
-        run: mkdir -p "$RUNNER_TEMP/2ship-smoke/logs"
+        run: |
+          set -Eeuo pipefail
+          mkdir -p "$RUNNER_TEMP/2ship-smoke/logs" "$RUNNER_TEMP/2ship-smoke/private"
 
-      - name: Download staged DMG from this repository
+      - name: Download DMG from test repository
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -28,29 +29,60 @@ jobs:
             --pattern '2Ship.dmg' \
             --dir "$RUNNER_TEMP/2ship-download" \
             --clobber
-          ls -lh "$RUNNER_TEMP/2ship-download/2Ship.dmg"
+          test -s "$RUNNER_TEMP/2ship-download/2Ship.dmg"
 
-      - name: Mount DMG and copy application
+      - name: Download test ROM privately
+        shell: bash
+        env:
+          ROM_URL: ${{ secrets.PAL_ROM_URL }}
+        run: |
+          set -Eeuo pipefail
+          if [[ -z "${ROM_URL:-}" ]]; then
+            echo '::error::Set the repository Actions secret PAL_ROM_URL before running this test.'
+            exit 1
+          fi
+
+          ROM="$RUNNER_TEMP/2ship-smoke/private/n64_eu.z64"
+          # Do not echo the URL, copy the ROM to an artifact or enable shell tracing.
+          curl --fail --location --silent --show-error --retry 3 \
+            --connect-timeout 20 --max-time 240 \
+            --output "$ROM" "$ROM_URL"
+
+          python3 - "$ROM" <<'PY'
+          from pathlib import Path
+          import sys
+
+          p = Path(sys.argv[1])
+          size = p.stat().st_size
+          with p.open('rb') as f:
+              magic = f.read(4)
+          if not (16 * 1024 * 1024 <= size <= 64 * 1024 * 1024):
+              raise SystemExit(f"Unexpected ROM size: {size} bytes (download may be an error page)")
+          if magic != bytes.fromhex('80371240'):
+              raise SystemExit(f"Unexpected .z64 ROM header: {magic.hex()} (download may be an HTML page)")
+          print(f"ROM file looks like a big-endian N64 image; size: {size} bytes")
+          PY
+
+          echo "SMOKE_ROM=$ROM" >> "$GITHUB_ENV"
+
+      - name: Mount DMG and prepare application
         shell: bash
         run: |
           set -Eeuo pipefail
-
           ROOT="$RUNNER_TEMP/2ship-smoke"
           DMG="$RUNNER_TEMP/2ship-download/2Ship.dmg"
           MOUNT="$ROOT/mount"
           mkdir -p "$MOUNT" "$ROOT/app"
 
-          test -s "$DMG"
           hdiutil verify "$DMG"
           hdiutil attach "$DMG" -readonly -nobrowse -mountpoint "$MOUNT"
           trap 'hdiutil detach "$MOUNT" -quiet || true' EXIT
 
           APP_SOURCE="$(find "$MOUNT" -maxdepth 3 -type d -name '*.app' -print -quit)"
           if [[ -z "$APP_SOURCE" ]]; then
-            echo '::error::No .app bundle was found in the DMG.'
+            echo '::error::No .app bundle found in DMG.'
             exit 1
           fi
-
           APP="$ROOT/app/$(basename "$APP_SOURCE")"
           ditto "$APP_SOURCE" "$APP"
           plutil -lint "$APP/Contents/Info.plist"
@@ -58,67 +90,95 @@ jobs:
           EXEC_NAME="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP/Contents/Info.plist")"
           BIN="$APP/Contents/MacOS/$EXEC_NAME"
           test -x "$BIN"
-
-          echo "Application: $APP"
-          echo "Executable: $BIN"
           file "$BIN"
           lipo -archs "$BIN"
           echo "SMOKE_BINARY=$BIN" >> "$GITHUB_ENV"
 
-      - name: Launch application and collect logs for 60 seconds
+      - name: Execute ROM extraction and start game
         shell: bash
         run: |
           set -Eeuo pipefail
-
           ROOT="$RUNNER_TEMP/2ship-smoke"
           LOGS="$ROOT/logs"
           mkdir -p "$ROOT/user-data"
           export SHIP_HOME="$ROOT/user-data"
 
-          echo "Executing: $SMOKE_BINARY"
-          echo 'No ROM is provided in this first smoke test: no menu/scene detection is expected.'
-
-          (cd "$ROOT" && "$SMOKE_BINARY") > "$LOGS/game.log" 2>&1 &
+          # exec makes the tracked PID the actual 2s2h process; correct cwd
+          # also permits SDL to find gamecontrollerdb.txt.
+          (
+            cd "$(dirname "$SMOKE_BINARY")"
+            exec "$SMOKE_BINARY" "$SMOKE_ROM"
+          ) > "$LOGS/game.log" 2>&1 &
           GAME_PID=$!
-          echo "pid=$GAME_PID" > "$LOGS/summary.txt"
 
-          FINISHED_EARLY=0
-          for SECOND in {1..60}; do
+          STOP_REASON=timeout_240s
+          STOPPED_BY_TEST=1
+          ENGINE_AT=0
+          SECOND=0
+
+          # Extraction can take longer than the no-ROM smoke test.
+          # Stop after the engine has run for another 30 seconds, or after 240 seconds.
+          for ((SECOND=1; SECOND<=240; SECOND++)); do
             if ! kill -0 "$GAME_PID" 2>/dev/null; then
-              FINISHED_EARLY=1
+              STOPPED_BY_TEST=0
+              STOP_REASON=process_exited
+              break
+            fi
+            if (( ENGINE_AT == 0 )) && grep -Fq 'Starting 2 Ship 2 Harkinian' "$LOGS/game.log"; then
+              ENGINE_AT=$SECOND
+              echo "Engine initialization observed after approximately ${SECOND}s"
+            fi
+            if (( ENGINE_AT > 0 && SECOND - ENGINE_AT >= 30 )); then
+              STOP_REASON=engine_stable_30s
               break
             fi
             sleep 1
           done
 
-          if [[ "$FINISHED_EARLY" -eq 0 ]]; then
-            echo 'duration=60s (process stopped by smoke test)' >> "$LOGS/summary.txt"
+          if (( STOPPED_BY_TEST == 1 )); then
             kill -TERM "$GAME_PID" 2>/dev/null || true
-            sleep 2
-            kill -KILL "$GAME_PID" 2>/dev/null || true
-          else
-            echo "duration=${SECOND}s (process exited on its own)" >> "$LOGS/summary.txt"
+            sleep 3
+            if kill -0 "$GAME_PID" 2>/dev/null; then
+              kill -KILL "$GAME_PID" 2>/dev/null || true
+            fi
           fi
 
           set +e
           wait "$GAME_PID"
           EXIT_CODE=$?
           set -e
-          echo "exit_code=$EXIT_CODE" >> "$LOGS/summary.txt"
 
-          if grep -q 'Starting 2 Ship 2 Harkinian' "$LOGS/game.log"; then
-            echo 'engine_initialized=yes' >> "$LOGS/summary.txt"
-          else
-            echo 'engine_initialized=not_observed (expected without ROM)' >> "$LOGS/summary.txt"
+          # The application writes mm.o2r to its app-data directory.
+          MM_O2R="$(find "$HOME/Library/Application Support" "$ROOT" \
+            -type f -name mm.o2r -print -quit 2>/dev/null || true)"
+          ARCHIVE_OK=no
+          if [[ -n "$MM_O2R" && -s "$MM_O2R" ]]; then
+            if unzip -tqq "$MM_O2R" > "$LOGS/archive-check.log" 2>&1; then
+              ARCHIVE_OK=yes
+            fi
           fi
 
-          echo '=== SUMMARY ==='
-          cat "$LOGS/summary.txt"
-          echo '=== GAME LOG (last 150 lines) ==='
-          tail -n 150 "$LOGS/game.log" || true
+          ENGINE_OK=no
+          if grep -Fq 'Starting 2 Ship 2 Harkinian' "$LOGS/game.log"; then
+            ENGINE_OK=yes
+          fi
 
-          # macOS unified logs and crash diagnostics may contain extra details.
-          /usr/bin/log show --last 3m --style compact \
+          SCENE_LOG_COUNT="$(grep -Eic 'entrance:|loading scene|load scene|scene [0-9]+|cutscene' "$LOGS/game.log" || true)"
+          {
+            echo "stop_reason=$STOP_REASON"
+            echo "elapsed_seconds=$SECOND"
+            echo "exit_code=$EXIT_CODE"
+            echo "stopped_by_test=$STOPPED_BY_TEST"
+            echo "mm_o2r_found=$([[ -n "$MM_O2R" ]] && echo yes || echo no)"
+            echo "mm_o2r_zip_valid=$ARCHIVE_OK"
+            if [[ -n "$MM_O2R" ]]; then
+              echo "mm_o2r_size_bytes=$(stat -f%z "$MM_O2R")"
+            fi
+            echo "engine_initialized=$ENGINE_OK"
+            echo "potential_scene_log_lines=$SCENE_LOG_COUNT"
+          } > "$LOGS/summary.txt"
+
+          /usr/bin/log show --last 7m --style compact \
             --predicate 'process == "2s2h"' \
             > "$LOGS/macos-unified.log" 2>&1 || true
 
@@ -127,24 +187,34 @@ jobs:
             mkdir -p "$LOGS/crash-reports"
             find "$CRASH_DIR" -maxdepth 1 -type f \
               \( -iname '*2s2h*' -o -iname '*2ship*' \) \
-              -mmin -5 -exec cp {} "$LOGS/crash-reports/" \; || true
+              -mmin -10 -exec cp {} "$LOGS/crash-reports/" \; || true
           fi
 
-          if [[ "$FINISHED_EARLY" -eq 1 && "$EXIT_CODE" -ne 0 ]]; then
-            echo "::error::Application exited after ${SECOND}s with code $EXIT_CODE. Inspect game.log."
+          echo '=== SUMMARY ==='
+          cat "$LOGS/summary.txt"
+          echo '=== GAME LOG (last 100 lines) ==='
+          tail -n 100 "$LOGS/game.log" || true
+
+          # Never upload the downloaded ROM or the generated mm.o2r.
+          if [[ "$ARCHIVE_OK" != yes ]]; then
+            echo '::error::mm.o2r was not generated or is not a valid ZIP/O2R archive.'
             exit 1
           fi
-          if [[ "$FINISHED_EARLY" -eq 1 ]]; then
-            echo "::warning::Application exited after ${SECOND}s with code 0. This does not establish game initialization."
-          else
-            echo '::notice::Application survived 60 seconds. This does not establish menu or scene loading without a ROM.'
+          if [[ "$ENGINE_OK" != yes ]]; then
+            echo '::error::Game engine initialization was not observed.'
+            exit 1
           fi
+          if [[ "$STOP_REASON" != engine_stable_30s ]]; then
+            echo '::error::Game did not stay alive for 30 seconds after engine initialization.'
+            exit 1
+          fi
+          echo '::notice::ROM extracted; game engine initialized and stayed alive for 30 seconds.'
 
-      - name: Upload smoke-test logs
+      - name: Upload diagnostics (logs only)
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: 2ship-macos-smoke-logs
+          name: macos-runtime-logs
           path: ${{ runner.temp }}/2ship-smoke/logs
-          retention-days: 7
+          retention-days: 3
           if-no-files-found: warn
