@@ -38,17 +38,64 @@ jobs:
         run: |
           set -Eeuo pipefail
           if [[ -z "${ROM_URL:-}" ]]; then
-            echo '::error::Set the repository Actions secret PAL_ROM_URL before running this test.'
+            echo '::error::Configure the repository secret PAL_ROM_URL with the tmpfiles.org landing-page URL.'
             exit 1
           fi
 
           ROM="$RUNNER_TEMP/2ship-smoke/private/n64_eu.z64"
-          # Do not echo the URL, copy the ROM to an artifact or enable shell tracing.
+          DOWNLOAD_URL="$ROM_URL"
+
+          # tmpfiles.org landing pages return HTML; resolve their current /dl/ href.
+          # Do not print either the landing URL or the temporary direct URL in logs.
+          if [[ "$ROM_URL" =~ ^https?://(www\.)?tmpfiles\.org/ ]] && \
+             [[ ! "$ROM_URL" =~ ^https?://(www\.)?tmpfiles\.org/dl/ ]]; then
+            PAGE="$RUNNER_TEMP/2ship-smoke/private/tmpfiles-landing.html"
+            curl --fail --location --silent --show-error --retry 2 \
+              --connect-timeout 20 --max-time 45 \
+              --output "$PAGE" "$ROM_URL"
+
+            DOWNLOAD_URL="$(python3 - "$PAGE" "$ROM_URL" <<'PYEXTRACT'
+          from html.parser import HTMLParser
+          from pathlib import Path
+          from urllib.parse import urljoin, urlsplit, urlunsplit, unquote
+          import sys
+
+          class LinkParser(HTMLParser):
+              def __init__(self):
+                  super().__init__()
+                  self.urls = []
+
+              def handle_starttag(self, tag, attrs):
+                  if tag == 'a':
+                      self.urls.extend(value for key, value in attrs if key == 'href' and value)
+
+          page = Path(sys.argv[1]).read_text(encoding='utf-8', errors='replace')
+          landing_url = sys.argv[2]
+          filename = unquote(urlsplit(landing_url).path.rsplit('/', 1)[-1])
+          links = LinkParser()
+          links.feed(page)
+
+          for href in links.urls:
+              candidate = urlsplit(urljoin(landing_url, href))
+              if (candidate.hostname in ('tmpfiles.org', 'www.tmpfiles.org')
+                      and candidate.path.startswith('/dl/')
+                      and unquote(candidate.path.rsplit('/', 1)[-1]) == filename):
+                  # Upgrade HTTP download links embedded in the page to HTTPS.
+                  print(urlunsplit(('https', candidate.netloc, candidate.path, candidate.query, '')))
+                  break
+          else:
+              raise SystemExit('Unable to find a download link on the tmpfiles.org page; the upload may have expired.')
+          PYEXTRACT
+            )"
+          fi
+
           curl --fail --location --silent --show-error --retry 3 \
             --connect-timeout 20 --max-time 240 \
-            --output "$ROM" "$ROM_URL"
+            --referer "$ROM_URL" \
+            --output "$ROM" "$DOWNLOAD_URL"
 
-          python3 - "$ROM" <<'PY'
+          # Reject an HTML landing/error page even if the host returned HTTP 200.
+          python3 - "$ROM" <<'PYVALIDATE'
           from pathlib import Path
           import sys
 
@@ -57,11 +104,11 @@ jobs:
           with p.open('rb') as f:
               magic = f.read(4)
           if not (16 * 1024 * 1024 <= size <= 64 * 1024 * 1024):
-              raise SystemExit(f"Unexpected ROM size: {size} bytes (download may be an error page)")
+              raise SystemExit(f'Unexpected ROM size: {size} bytes (download may be an error page)')
           if magic != bytes.fromhex('80371240'):
-              raise SystemExit(f"Unexpected .z64 ROM header: {magic.hex()} (download may be an HTML page)")
-          print(f"ROM file looks like a big-endian N64 image; size: {size} bytes")
-          PY
+              raise SystemExit(f'Unexpected .z64 ROM header: {magic.hex()} (not a big-endian N64 ROM)')
+          print(f'Download OK: big-endian N64 ROM, {size} bytes')
+          PYVALIDATE
 
           echo "SMOKE_ROM=$ROM" >> "$GITHUB_ENV"
 
