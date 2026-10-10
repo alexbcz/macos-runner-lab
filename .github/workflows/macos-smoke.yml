@@ -158,15 +158,15 @@ jobs:
           ) > "$LOGS/game.log" 2>&1 &
           GAME_PID=$!
 
-          STOP_REASON=timeout_240s
+          STOP_REASON=timeout_300s
           STOPPED_BY_TEST=1
           ENGINE_AT=0
           SECOND=0
 
           # Extraction can take longer than the no-ROM smoke test.
           # Allow time for the full automatic sequence observed on Linux.
-          # Stop after 90 seconds of engine runtime, or after 240 seconds total.
-          for ((SECOND=1; SECOND<=240; SECOND++)); do
+          # Stop after 180 seconds of engine runtime, or after 300 seconds total.
+          for ((SECOND=1; SECOND<=300; SECOND++)); do
             if ! kill -0 "$GAME_PID" 2>/dev/null; then
               STOPPED_BY_TEST=0
               STOP_REASON=process_exited
@@ -176,8 +176,8 @@ jobs:
               ENGINE_AT=$SECOND
               echo "Engine initialization observed after approximately ${SECOND}s"
             fi
-            if (( ENGINE_AT > 0 && SECOND - ENGINE_AT >= 90 )); then
-              STOP_REASON=engine_stable_90s
+            if (( ENGINE_AT > 0 && SECOND - ENGINE_AT >= 180 )); then
+              STOP_REASON=engine_stable_180s
               break
             fi
             sleep 1
@@ -284,15 +284,15 @@ jobs:
             echo '::error::Game engine initialization was not observed.'
             exit 1
           fi
-          if [[ "$STOP_REASON" != engine_stable_90s ]]; then
-            echo '::error::Game did not stay alive for 90 seconds after engine initialization.'
+          if [[ "$STOP_REASON" != engine_stable_180s ]]; then
+            echo '::error::Game did not stay alive for 180 seconds after engine initialization.'
             exit 1
           fi
           if [[ "$SCENE_SEQUENCE_OK" != yes ]]; then
             echo '::error::The 3 expected entrance/cutscene events were not observed in order. See scene-sequence.txt.'
             exit 1
           fi
-          echo '::notice::ROM extracted; game engine stayed alive for 90 seconds and reached all 3 expected entrance markers.'
+          echo '::notice::ROM extracted; game engine stayed alive for 180 seconds and reached all 3 expected entrance markers.'
 
       - name: Upload diagnostics (logs only)
         if: always()
