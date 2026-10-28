@@ -8,7 +8,7 @@ permissions:
 
 jobs:
   smoke-macos:
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 12
     steps:
       - name: Prepare private test directories
